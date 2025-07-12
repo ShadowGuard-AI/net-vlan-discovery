@@ -1,0 +1,1 @@
+The `struct` module is a built-in Python module and does not require external installation using `pip`.  Therefore, it doesn't need a version constraint in a `requirements.txt` or similar file.  It's part of the core Python language.
