@@ -30,6 +30,8 @@ def setup_argparse():
                         help="Timeout in seconds for ARP resolution. Default: 1.0")  # ARP resolution timeout
     parser.add_argument("--payload", dest="payload", default="VLAN Discovery Probe",
                         help="Payload of the packet sent.")  # Customizable payload
+    parser.add_argument("--src-ip", dest="src_ip",
+                        help="Source IP address for the crafted packets. If not provided, the address assigned to the interface is used.")
     return parser.parse_args()
 
 
@@ -50,6 +52,24 @@ def get_mac_address(interface):
         return ':'.join('%02x' % b for b in info[18:24])
     except Exception as e:
         logging.error(f"Error getting MAC address for {interface}: {e}")
+        return None
+
+
+def get_ip_address(interface):
+    """
+    Retrieves the IPv4 address assigned to a given network interface.
+    Args:
+        interface (str): The name of the network interface.
+    Returns:
+        str: The IPv4 address of the interface, or None if an error occurs.
+    """
+    try:
+        import fcntl
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        info = fcntl.ioctl(s.fileno(), 0x8915, struct.pack('256s', bytes(interface, 'utf-8')[:15]))
+        return socket.inet_ntoa(info[20:24])
+    except Exception as e:
+        logging.error(f"Error getting IP address for {interface}: {e}")
         return None
 
 
@@ -82,7 +102,7 @@ def resolve_mac_address(ip_address, interface, timeout=1.0):
         return None
 
 
-def craft_vlan_packet(src_mac, dst_mac, vlan_id, target_ip, target_port, payload):
+def craft_vlan_packet(src_mac, dst_mac, vlan_id, target_ip, target_port, payload, src_ip=None):
     """
     Crafts an Ethernet frame with a VLAN tag and a TCP payload.
     Args:
@@ -111,14 +131,16 @@ def craft_vlan_packet(src_mac, dst_mac, vlan_id, target_ip, target_port, payload
         ip_version = 4
         ip_ihl = 5  # Minimum header length
         ip_tos = 0
-        ip_length = 20 + len(payload.encode())  # IP header length + TCP payload length
+        ip_length = 20 + 20 + len(payload.encode())  # IP header length + TCP header length + payload length
         ip_id = 12345  # Dummy ID
         ip_flags = 0
         ip_frag_offset = 0
         ip_ttl = 64  # Time to live
         ip_protocol = 6  # TCP
         ip_checksum = 0  # Will be calculated later, placeholder
-        ip_src = socket.inet_aton("192.168.1.1")  # Replace with appropriate source IP if needed.  Important for routing.  Consider adding as argument.
+        # Source IP: the --src-ip value when given, otherwise the address
+        # assigned to the sending interface (resolved by the caller).
+        ip_src = socket.inet_aton(src_ip) if src_ip else socket.inet_aton("127.0.0.1")
         ip_dst = socket.inet_aton(target_ip)
 
         ip_header = struct.pack('!BBHHHBBH4s4s',
@@ -173,43 +195,121 @@ def calculate_checksum(data):
     s = 0
     n = len(data) % 2
     for i in range(0, len(data)-n, 2):
-        s += data[i] + (data[i+1] << 8)
+        # Network byte order: the first byte of each pair is the high byte.
+        s += (data[i] << 8) + data[i+1]
     if n:
-        s += data[len(data)-1]
+        s += data[len(data)-1] << 8
     while (s >> 16):
         s = (s & 0xFFFF) + (s >> 16)
     s = ~s & 0xffff
     return s
 
 
-def send_and_receive(interface, packet, timeout):
+def is_probe_response(data, target_ip, target_port):
     """
-    Sends a packet on the specified interface and listens for a response.
+    Checks whether a received packet is a reply to the probe: an IPv4
+    TCP packet from the target address and the probed port, carrying
+    SYN reply flags (SYN and ACK both set).
 
     Args:
-        interface (str): The network interface to use.
-        packet (bytes): The packet to send.
-        timeout (float): The timeout in seconds for receiving a response.
+        data (bytes): The received packet, Ethernet header included.
+        target_ip (str): The probed target IP address.
+        target_port (int): The probed destination port.
 
     Returns:
-        bytes: The received data, or None if no response is received within the timeout.
+        bool: True only when the packet matches the probe.
     """
+    try:
+        if len(data) < 14:
+            return False
+        eth_type = struct.unpack('!H', data[12:14])[0]
+        ip_offset = 14
+        if eth_type == 0x8100:  # 802.1Q tagged frame
+            if len(data) < 18:
+                return False
+            eth_type = struct.unpack('!H', data[16:18])[0]
+            ip_offset = 18
+        if eth_type != 0x0800:  # Not IPv4
+            return False
+        ip_header = data[ip_offset:ip_offset + 20]
+        if len(ip_header) < 20:
+            return False
+        iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
+        ihl = (iph[0] & 0x0F) * 4
+        if iph[6] != 6:  # Not TCP
+            return False
+        if socket.inet_ntoa(iph[8]) != target_ip:  # Source is not the target
+            return False
+        tcp_offset = ip_offset + ihl
+        tcp_header = data[tcp_offset:tcp_offset + 20]
+        if len(tcp_header) < 20:
+            return False
+        src_port = struct.unpack('!H', tcp_header[0:2])[0]
+        if src_port != target_port:
+            return False
+        flags = tcp_header[13]
+        return (flags & 0x02) != 0 and (flags & 0x10) != 0  # SYN and ACK
+    except Exception:
+        return False
+
+
+def send_and_receive_status(interface, packet, timeout, target_ip=None, target_port=None):
+    """
+    Sends a packet and waits for a matching response.
+
+    Returns:
+        tuple: (status, data) where status is "answered" when a packet
+        matching the probe arrived, "no_response" when the wait timed
+        out with no matching packet, and "failed" when sending or
+        receiving raised an error. Unrelated packets received during
+        the wait are ignored.
+    """
+    s = None
     try:
         s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003)) # ETH_P_ALL
         s.bind((interface, 0))
         s.send(packet)
         s.settimeout(timeout)
 
-        try:
-            data = s.recv(65535) # Maximum IP packet size
-            return data
-        except socket.timeout:
-            return None  # Timeout occurred, no response received
-        finally:
-            s.close() # close the socket no matter what
+        while True:
+            try:
+                data = s.recv(65535) # Maximum IP packet size
+            except socket.timeout:
+                return ("no_response", None)
+            if target_ip is None or target_port is None:
+                return ("answered", data)
+            if is_probe_response(data, target_ip, target_port):
+                return ("answered", data)
+            # Unrelated packet: keep waiting until the timeout.
     except Exception as e:
         logging.error(f"Error sending/receiving data on interface {interface}: {e}")
-        return None
+        return ("failed", None)
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def send_and_receive(interface, packet, timeout, target_ip=None, target_port=None):
+    """
+    Sends a packet on the specified interface and listens for a response
+    that matches the probe (see is_probe_response).
+
+    Args:
+        interface (str): The network interface to use.
+        packet (bytes): The packet to send.
+        timeout (float): The timeout in seconds for receiving a response.
+        target_ip (str): The probed target IP address.
+        target_port (int): The probed destination port.
+
+    Returns:
+        bytes: The matching received data, or None if no matching
+        response is received within the timeout.
+    """
+    status, data = send_and_receive_status(interface, packet, timeout, target_ip, target_port)
+    return data
 
 
 
@@ -246,19 +346,49 @@ def main():
             sys.exit(1)
         logging.info(f"Resolved destination MAC address: {dst_mac}")
 
+    # Resolve the source IP for the crafted packets
+    src_ip = args.src_ip
+    if not src_ip:
+        src_ip = get_ip_address(args.interface)
+        if not src_ip:
+            logging.error("Could not determine the source IP address from the interface. Please specify with --src-ip.")
+            sys.exit(1)
+        logging.info(f"Using source IP address: {src_ip}")
+
     logging.info(f"Scanning VLAN range {vlan_start}-{vlan_end} on interface {args.interface} targeting {args.target}:{args.port}")
+
+    sent = 0
+    answered = 0
+    failed = 0
+    attempted = 0
 
     # Iterate through VLAN IDs
     for vlan_id in range(vlan_start, vlan_end + 1):
-        packet = craft_vlan_packet(src_mac, dst_mac, vlan_id, args.target, args.port, args.payload)
+        attempted += 1
+        packet = craft_vlan_packet(src_mac, dst_mac, vlan_id, args.target, args.port, args.payload, src_ip=src_ip)
         if packet:
-            response = send_and_receive(args.interface, packet, args.timeout)
-            if response:
-                logging.info(f"VLAN {vlan_id}: Received response.") # A response indicates that the VLAN is likely active.
+            status, response = send_and_receive_status(args.interface, packet, args.timeout, args.target, args.port)
+            if status == "failed":
+                failed += 1
+                logging.warning(f"VLAN {vlan_id}: Probe failed to send or receive.")
             else:
-                logging.debug(f"VLAN {vlan_id}: No response received.")
+                sent += 1
+                if status == "answered" and response:
+                    answered += 1
+                    logging.info(f"VLAN {vlan_id}: Received a matching response. The VLAN is likely active.")
+                else:
+                    logging.debug(f"VLAN {vlan_id}: No matching response received.")
         else:
+            failed += 1
             logging.warning(f"Skipping VLAN {vlan_id} due to packet crafting failure.")
+
+    summary = f"Scan summary: sent={sent}, answered={answered}, failed={failed}"
+    logging.info(summary)
+    print(summary)
+
+    if attempted and failed == attempted:
+        logging.error("Every probe failed; no probe was sent.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
