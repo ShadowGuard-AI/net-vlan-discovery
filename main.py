@@ -123,6 +123,8 @@ def craft_vlan_packet(src_mac, dst_mac, vlan_id, target_ip, target_port, payload
         eth_header = struct.pack('!6s6sH', eth_dst, eth_src, eth_type)
 
         # 802.1Q VLAN header
+        # Masking to 12 bits throws the priority and drop eligible bits away. This probe only
+        # ever tests plain VLAN membership, never the QoS side of the tag.
         vlan_tci = vlan_id & 0x0FFF  # VLAN ID, 12 bits
         vlan_tpid = 0x0800  # IP Protocol
         vlan_header = struct.pack('!HH', vlan_tci, vlan_tpid)
@@ -149,6 +151,8 @@ def craft_vlan_packet(src_mac, dst_mac, vlan_id, target_ip, target_port, payload
                                  ip_checksum, ip_src, ip_dst)
 
         # TCP Header (Minimal, assuming default values are acceptable)
+        # Source port and sequence are the same fixed values on every VLAN I probe. Replies are
+        # matched without either, so the numbers only matter to the target, not to my matching.
         tcp_src_port = 12345  # Dummy source port
         tcp_dst_port = target_port
         tcp_seq_num = 0
@@ -177,6 +181,8 @@ def craft_vlan_packet(src_mac, dst_mac, vlan_id, target_ip, target_port, payload
                                  tcp_ack_num, (tcp_data_offset << 4), tcp_flags,
                                  tcp_window_size, tcp_checksum, tcp_urgent_ptr)
         # Combine headers and payload
+        # I put payload bytes in a SYN packet. Some stacks treat data on a SYN oddly or drop it,
+        # so silence can mean my packet shape was rejected rather than the VLAN being absent.
         packet = eth_header + vlan_header + ip_header + tcp_header + payload.encode()
         return packet
     except Exception as e:
@@ -248,6 +254,9 @@ def is_probe_response(data, target_ip, target_port):
         if src_port != target_port:
             return False
         flags = tcp_header[13]
+        # My match stops at source address, source port, and these two flags. I never check the
+        # destination port or the ack number, so an unrelated SYN ACK from the same service,
+        # for some other connection of mine, would count as this VLAN answering.
         return (flags & 0x02) != 0 and (flags & 0x10) != 0  # SYN and ACK
     except Exception:
         return False
@@ -363,6 +372,8 @@ def main():
     attempted = 0
 
     # Iterate through VLAN IDs
+    # One fresh socket and up to a full timeout per VLAN. The default sweep of 4094 IDs at
+    # 2 seconds each is an hours long worst case, and I print no progress while it runs.
     for vlan_id in range(vlan_start, vlan_end + 1):
         attempted += 1
         packet = craft_vlan_packet(src_mac, dst_mac, vlan_id, args.target, args.port, args.payload, src_ip=src_ip)
